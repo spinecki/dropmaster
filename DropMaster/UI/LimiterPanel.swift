@@ -24,6 +24,17 @@
 //  2026-09-20 - two ways to say the same thing, and the slider's dB were
 //  not the LUFS they produced anyway.
 //
+//  Clipper (off by default) puts a soft clipper before the limiter, on
+//  every match while it is on - not only when a target is out of reach -
+//  so that switching it is a comparison you can hear: only the limiter
+//  stage runs again, and playback carries on at the same place. A
+//  checkbox switches it, a stepped slider like Release sets how deep it
+//  may cut (1 ... 9 dB, or Max), and the slider keeps its place while the
+//  box is unticked - so On against Off is one click at the same setting.
+//  In 1.3 it was a bare switch, and on was Max: against a loud reference,
+//  a dynamic target came out clipped 7 dB deep. 1.3.1 folded Off into the
+//  slider; 1.3.2 gave it its own box back, with the CL bar in the meter.
+//
 //  Target replaces "as loud as the reference" with an integrated LUFS: a
 //  box of streaming platforms, and - / + for any value from -24 to -6 in
 //  half-LU steps (a tenth with Option). No text field: it needed parsing
@@ -61,7 +72,7 @@ struct LimiterPanel: View {
                 Button("Reset") { model.limiter = LimiterSettings() }
                     .controlSize(.small)
                     .disabled(model.limiter == LimiterSettings())
-                    .help("Back to the reference's own loudness, automatic ceiling and release, limiter on")
+                    .help("Back to the reference's own loudness, automatic ceiling and release, limiter on, clipper off")
             }
 
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
@@ -109,6 +120,20 @@ struct LimiterPanel: View {
                     Text(model.limiter.autoRelease ? "Auto" : String(format: "%.0f ms", model.limiter.releaseMilliseconds))
                         .frame(width: 76, alignment: .trailing)
                 }
+                GridRow {
+                    Text("Clipper")
+                    Toggle("On", isOn: $model.limiter.clipper)
+                        .controlSize(.small)
+                        .disabled(!model.limiter.enabled)
+                        .help("A soft clipper before the limiter takes the peaks; the limiter does the rest. Reaches dense, clipped references the limiter alone cannot. Off: nothing is clipped.")
+                    Slider(value: clipPosition, in: 0...Double(LimiterSettings.clipSteps.count), step: 1)
+                        .controlSize(.small)
+                        .disabled(!model.limiter.enabled || !model.limiter.clipper)
+                        .help("How deep the clipper may cut the loudest peak: 1 to 9 dB, or Max for no limit. Watch CL and GR in the meter to see how the two share the work.")
+                    Text(clipText)
+                        .foregroundStyle(model.limiter.enabled && model.limiter.clipper ? Color.primary : Color.secondary)
+                        .frame(width: 76, alignment: .trailing)
+                }
             }
             .font(.callout)
             .monospacedDigit()
@@ -147,12 +172,37 @@ struct LimiterPanel: View {
     private var resultingLoudness: String {
         guard case .done(let report) = model.match else { return " " }
         let lufs = model.matchedStats?.integrated.map { String(format: "%.1f LUFS", $0) } ?? "…"
+        // The clipper's depth is not added here: the line is already as
+        // wide as the panel allows. It shows beside Gain and Limiter above
+        // the curves.
         let reduction = model.limiter.enabled ? String(format: " · GR max %.1f dB", report.limiterReductionDB) : ""
         if let target = report.targetLUFS, !report.targetReached {
             let reached = report.resultLUFS.map { String(format: "%.1f LUFS", $0) } ?? lufs
             return String(format: "%.1f not reachable · max %@", target, reached)
         }
         return "Result \(lufs)\(reduction)"
+    }
+
+    /// The setting, shown whether the box is ticked or not - greyed with
+    /// the slider when it is not.
+    private var clipText: String {
+        model.limiter.clipLimitDB.map { String(format: "%.0f dB", $0) } ?? "Max"
+    }
+
+    /// The clipper slider: the limits, then Max. A stored limit between the
+    /// stops shows at the nearest one.
+    private var clipPosition: Binding<Double> {
+        let steps = LimiterSettings.clipSteps
+        return Binding(
+            get: {
+                guard let limit = model.limiter.clipLimitDB else { return Double(steps.count) }
+                let nearest = steps.indices.min { abs(steps[$0] - limit) < abs(steps[$1] - limit) } ?? 0
+                return Double(nearest)
+            },
+            set: {
+                let position = min(steps.count, max(0, Int($0.rounded())))
+                model.limiter.clipLimitDB = position < steps.count ? steps[position] : nil
+            })
     }
 
     private var ceilingText: String {

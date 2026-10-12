@@ -39,6 +39,9 @@ nonisolated final class StereoAudio: @unchecked Sendable {
     /// `Limiter.reductionChunk` frames (see Limiter), for the live meter.
     /// Empty for anything else. Set by the creator, like the samples.
     var gainReduction: [Float] = []
+    /// The same for the clipper in front of the limiter (see Clipper), when
+    /// it is on: its smallest gain in every `Limiter.reductionChunk` frames.
+    var clipReduction: [Float] = []
 
     /// Zeroed buffers of `frameCount` frames, for the creator to fill.
     init(frameCount: Int) {

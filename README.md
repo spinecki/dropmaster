@@ -76,9 +76,10 @@ to the files you pick.
   The matched row shows its distance to the reference. A true peak above
   0 dBTP turns orange: lossy encoding or a D/A converter will clip there.
 - **Output meter** (what is playing, after the A/B switch): L/R peak bars
-  (0 to −12 dB take the upper half of the scale), the limiter's gain
-  reduction at the playhead while Matched plays, and LUFS M (400 ms) /
-  LUFS S (3 s). Starting playback or seeking starts a fresh measurement.
+  (0 to −12 dB take the upper half of the scale), the clipper's (CL) and
+  the limiter's (GR) gain reduction at the playhead while Matched plays,
+  and LUFS M (400 ms) / LUFS S (3 s). Starting playback or seeking starts a
+  fresh measurement.
 
 ## Limiter
 
@@ -107,6 +108,22 @@ for a whole song); playback carries on with the new result.
 - **Release**: Auto (60 ms after a lone peak, up to 600 ms through dense passages) or
   one of 15 stops from 10 ms to 1 s (10, 15, 20, 30, 40, 50, 70, 100, 150,
   200, 300, 400, 500, 700, 1000).
+- **Clipper**: a checkbox switches it on, and a slider sets how deep it may
+  cut: 1 · 2 · 3 · 4 · 6 · 9 dB · Max, starting at 3 dB. The slider keeps its
+  place while the box is unticked, so On against Off is one click at the
+  same setting. A soft clipper before the limiter takes the peaks, and the
+  limiter is left with about 1.5 dB. This is for references that were made
+  loud by clipping, which the limiter alone cannot reach. The setting is how
+  deep the clipper may cut the loudest peak; where that is not enough, the
+  limiter does the rest, and the target may show as out of reach. The output
+  meter's CL and GR bars show how the two share the work at the playhead.
+  Max sets no limit, which brings a dynamic target up to a loud reference
+  however deep that takes it, and can audibly distort. While it is on, the
+  clipper works on every match, not only when a target is out of reach, so
+  switching it is a comparison you can hear: playback carries on at the same
+  place. How deep it cut shows beside Gain and Limiter. Off, nothing is
+  clipped, and the result is exactly what DropMaster 1.2 gave. (In 1.3 it
+  was a switch, and on was Max; such settings and presets open at Max.)
 
 The settings are remembered on this Mac.
 
@@ -158,12 +175,21 @@ reference had, or at the target set in the limiter panel.
   removed, so the result is sample-aligned with the original.
 - **Level**: gain so the loud blocks' Mid RMS equals the reference's,
   measured three times on a copy clipped at the ceiling.
+- **Clipper** (optional): per channel, linear up to a knee 1.5 dB below
+  the ceiling, then a tanh towards a cap 1.5 dB above it, at four times the
+  sample rate. Only the difference the curve makes goes through the
+  oversampling filters, so everything below the knee is the input bit for
+  bit. A 15 kHz tone driven 6 dB past the knee leaves an alias 88 dB down
+  (18 dB without oversampling). With a limit, knee and cap move up until
+  the loudest peak is cut exactly that deep.
 - **Limiter**: look-ahead brickwall (3 ms, programme-dependent release),
   ceiling = the reference's peak, never above -0.1 dBFS.
 
-One known limit: a reference that was *clipped* to its loudness cannot be
-reached without clipping, and DropMaster does not clip. Against pink noise
-clipped by 12 dB the result stays about 3 dB quieter (see the harness).
+One known limit, with the Clipper off: a reference that was *clipped* to its
+loudness cannot be reached without clipping. Against pink noise clipped by
+12 dB the result stays about 3 dB quieter. With the Clipper at Max it comes
+within 0.1 dB; the limits in between land in between (1 dB: −3.1, 3 dB:
+−2.6, 6 dB: −0.9, 9 dB: 0.0; see the harness).
 
 ## Origin
 
@@ -173,15 +199,22 @@ made popular. DropMaster is a clean-room implementation: no Matchering code,
 comments or text were used, and its methods differ (block selection,
 smoothing, filter design, limiter). Matchering is GPLv3; DropMaster is MIT.
 
+The Clipper was prompted by Sony Research's
+[ITO-Master](https://github.com/SonyResearch/ITO-Master) (ISMIR 2025). Its
+mastering chain also matches a reference's density (crest factor), with a
+distortion stage. Only that idea was taken. ITO-Master's code and models
+are CC BY-NC 4.0, and none of them are in DropMaster.
+
 ## Building
 
 - Xcode 26, macOS 26.5, Apple Silicon.
 - `./build_dmg.sh` - Release build, install to /Applications, and a `.dmg`
   in `build/` (`--no-install` leaves /Applications alone).
 - `Verification/run.sh [-O]` - the engine harness: FFT/FIR scaling,
-  self-match, tone and level matching on pink noise, the ceiling, WAV
-  round trips of every export format and quality, the decoder, the A/B
-  player, LUFS / LRA / true peak on the EBU test signals, the limiter
+  self-match, tone and level matching on pink noise, the ceiling, the
+  clipper (bit-exact below its knee, alignment, aliasing, a clipped
+  reference, its depth limits), WAV round trips of every export format and quality, the
+  decoder, the A/B player, LUFS / LRA / true peak on the EBU test signals, the limiter
   settings, and presets (curve accuracy, round trip, matching through one;
   reference profiles against the old curve maths, sets of five slots,
   damaged and future files refused).

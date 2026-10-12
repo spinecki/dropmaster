@@ -2,8 +2,12 @@
 //  LiveMeter.swift
 //  DropMaster
 //
-//  What is playing, as it plays: peak per channel, the limiter's gain
-//  reduction while Matched is heard, and momentary and short-term loudness.
+//  What is playing, as it plays: peak per channel, the clipper's (CL) and
+//  the limiter's (GR) gain reduction while Matched is heard, and momentary
+//  and short-term loudness. CL and GR stand side by side on one scale, in
+//  signal order, because how the two share the work is what the Clipper
+//  setting is tuned by: the deeper the clipper may cut, the less is left
+//  for the limiter.
 //
 //  Upright bars, as on a console: the column beside the curve is tall and
 //  narrow, and a meter that uses the height resolves the top 6 dB - where
@@ -37,16 +41,15 @@ struct LiveMeter: View {
                 }
                 TimelineView(.periodic(from: .now, by: 0.25)) { _ in
                     let levels = player.readMeters()
-                    VStack(alignment: .leading, spacing: 12) {
-                        LoudnessReadout(value: levels.momentary.map { String(format: "%.1f", $0) }, label: "LUFS M",
-                                        help: "Momentary loudness of what is playing: the last 400 ms, K-weighted.")
-                        LoudnessReadout(value: levels.shortTerm.map { String(format: "%.1f", $0) }, label: "LUFS S",
-                                        help: "Short-term loudness of what is playing: the last 3 seconds, K-weighted.")
-                        let peak = max(levels.left, levels.right)
-                        LoudnessReadout(value: peak > 1e-5 ? String(format: "%.1f", 20 * log10(Double(peak))) : nil,
-                                        label: "dBFS peak", help: "Peak level of what is playing")
-                        LoudnessReadout(value: levels.reductionDB < -0.05 ? String(format: "%.1f", levels.reductionDB) : nil,
-                                        label: "dB GR", help: "Gain reduction of the limiter at the playhead, while Matched plays")
+                    // Five figures, one above the other (side by side, two
+                    // were wider than the column), in whatever height the
+                    // window leaves: roomy if it fits, tighter if not. With
+                    // the fifth (CL) and no fallback, they ran out of the
+                    // panel into the limiter's below.
+                    ViewThatFits(in: .vertical) {
+                        readouts(levels, spacing: 8, size: 17)
+                        readouts(levels, spacing: 4, size: 17)
+                        readouts(levels, spacing: 2, size: 14)
                     }
                 }
             }
@@ -55,14 +58,31 @@ struct LiveMeter: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
     }
+
+    private func readouts(_ levels: LiveLevels, spacing: CGFloat, size: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            LoudnessReadout(value: levels.momentary.map { String(format: "%.1f", $0) }, label: "LUFS M",
+                            help: "Momentary loudness of what is playing: the last 400 ms, K-weighted.", size: size)
+            LoudnessReadout(value: levels.shortTerm.map { String(format: "%.1f", $0) }, label: "LUFS S",
+                            help: "Short-term loudness of what is playing: the last 3 seconds, K-weighted.", size: size)
+            let peak = max(levels.left, levels.right)
+            LoudnessReadout(value: peak > 1e-5 ? String(format: "%.1f", 20 * log10(Double(peak))) : nil,
+                            label: "dBFS peak", help: "Peak level of what is playing", size: size)
+            LoudnessReadout(value: levels.clipDB < -0.05 ? String(format: "%.1f", levels.clipDB) : nil,
+                            label: "dB CL", help: "Gain reduction of the clipper at the playhead, while Matched plays", size: size)
+            LoudnessReadout(value: levels.reductionDB < -0.05 ? String(format: "%.1f", levels.reductionDB) : nil,
+                            label: "dB GR", help: "Gain reduction of the limiter at the playhead, while Matched plays", size: size)
+        }
+    }
 }
 
-/// L, R and GR as upright bars on a dB scale. Plain values only.
+/// L, R, CL and GR as upright bars on a dB scale. Plain values only.
 ///
 /// The peak scale is not linear in dB: 0 to -12 dB takes the upper half,
 /// -12 to -48 the lower. A master spends its life in the top few dB, and
-/// on a linear scale they were an eighth of the bar. Gain reduction has its
-/// own scale, 0 to -12 dB from the top, marked on its right.
+/// on a linear scale they were an eighth of the bar. Gain reduction - the
+/// clipper's and the limiter's - has its own scale, 0 to -12 dB from the
+/// top, marked on the right.
 struct MeterBars: View {
     let levels: LiveLevels
 
@@ -82,9 +102,12 @@ struct MeterBars: View {
             scale(Self.peakTicks, position: Self.position, alignment: .trailing)
             channel("L", fraction: Self.position(db(levels.left)), color: color(levels.left), fromTop: false)
             channel("R", fraction: Self.position(db(levels.right)), color: color(levels.right), fromTop: false)
+            channel("CL", fraction: min(max(-Double(levels.clipDB) / Self.reductionRangeDB, 0), 1),
+                    color: .purple, fromTop: true)
+                .padding(.leading, 6)
+                .help("Gain reduction of the clipper at the playhead, 0 to −12 dB from the top, while Matched plays")
             channel("GR", fraction: min(max(-Double(levels.reductionDB) / Self.reductionRangeDB, 0), 1),
                     color: .orange, fromTop: true)
-                .padding(.leading, 6)
                 .help("Gain reduction of the limiter at the playhead, 0 to −12 dB from the top, while Matched plays")
             scale(Self.reductionTicks, position: { 1 + $0 / Self.reductionRangeDB }, alignment: .leading)
         }
@@ -140,11 +163,12 @@ struct LoudnessReadout: View {
     let value: String?
     let label: String
     let help: String
+    var size: CGFloat = 17
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(value ?? "–")
-                .font(.system(size: 17, weight: .medium, design: .rounded))
+                .font(.system(size: size, weight: .medium, design: .rounded))
                 .foregroundStyle(value == nil ? Color.secondary : Color.primary)
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }

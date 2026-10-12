@@ -26,7 +26,7 @@ struct ContentView: View {
                                  onChoose: { model.choose(role) })
                     }
                 }
-                .frame(height: 150)
+                .frame(height: 120)
 
                 HStack {
                     Spacer()
@@ -98,6 +98,9 @@ struct ContentView: View {
                     figure("Gain", String(format: "%+.1f dB", report.gainDB))
                     figure("Ceiling", String(format: "%.1f dBFS", report.ceilingDB))
                     figure("Limiter", String(format: "%.1f dB", report.limiterReductionDB))
+                    if report.clipReductionDB < -0.05 {
+                        figure("Clip", String(format: "%.1f dB", report.clipReductionDB))
+                    }
                 case .failed(let message):
                     Label(message, systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)

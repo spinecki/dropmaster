@@ -21,6 +21,9 @@
 //    should on their test signals, and the true peak finds the overshoot,
 //  - the limiter panel's settings do what they say, and the defaults give
 //    exactly what the match gave before the panel existed,
+//  - the clipper leaves everything below its knee bit for bit, stays
+//    sample-aligned, keeps its aliases down, reaches a clipped reference
+//    the limiter alone cannot, and never cuts deeper than its limit,
 //  - a preset carries the curve accurately enough at 1/24 octave, writes
 //    and reads back, and matches a new target through it,
 //  - a reference profile gives the correction the two spectra gave before
@@ -238,6 +241,163 @@ do {
     check(false, "matching threw \(error)")
 }
 
+// MARK: - Clipper
+
+print("Clipper")
+/// Level of `hz` in `x`, in dB, over a Hann window (a whole number of
+/// cycles in one second keeps it exact).
+func toneDB(_ x: [Float], hz: Double) -> Double {
+    var re = 0.0, im = 0.0
+    let n = x.count
+    for i in 0..<n {
+        let w = 0.5 - 0.5 * cos(2 * Double.pi * Double(i) / Double(n))
+        let phase = 2 * Double.pi * hz * Double(i) / StereoAudio.sampleRate
+        re += Double(x[i]) * w * cos(phase)
+        im -= Double(x[i]) * w * sin(phase)
+    }
+    return db(4 * sqrt(re * re + im * im) / Double(n))
+}
+do {
+    let ceiling: Float = 1
+    let cap = ceiling * Float(pow(10, Clipper.limiterShareDB / 20))
+    let knee = cap * Float(pow(10, -Clipper.kneeDB / 20))
+
+    // Below the knee: nothing happens, bit for bit.
+    let quiet = pinkStereo(seconds: 10, seed: 5, peak: 0.5)
+    let untouched = scaled(quiet, 1)
+    let none = try Clipper.process(untouched, ceiling: ceiling)
+    check(untouched.isIdentical(to: quiet) && none.reductionDB == 0 && none.record.allSatisfy { $0 == 1 },
+          "below the knee: output = input, bit for bit, an empty record")
+
+    // Above it: peaks under the cap, and still sample-aligned.
+    let hot = scaled(quiet, 3)
+    let clipped = scaled(hot, 1)
+    let reduction = try Clipper.process(clipped, ceiling: ceiling).reductionDB
+    // The low-pass overshoots the cap a little; the limiter after it
+    // takes that.
+    check(db(Double(clipped.peak)) <= db(Double(cap)) + 0.3,
+          "peak \(String(format: "%.2f", db(Double(clipped.peak)))) dBFS ≤ cap \(String(format: "%.2f", db(Double(cap)))) + 0.3 dB for the filter, reduction \(String(format: "%.1f", reduction)) dB")
+    func correlation(_ lag: Int) -> Double {
+        var sum = 0.0
+        for i in 100..<(hot.frameCount - 100) { sum += Double(hot.left[i]) * Double(clipped.left[i + lag]) }
+        return sum
+    }
+    let bestLag = (-8...8).max { correlation($0) < correlation($1) }!
+    check(bestLag == 0, "sample-aligned (correlation peaks at lag \(bestLag))")
+    // Interpolation and low-pass each reach tapsPerPhase / 2 samples.
+    var below = 0, far = 0
+    let around = Clipper.tapsPerPhase
+    for i in 0..<hot.frameCount where (max(0, i - around)...min(hot.frameCount - 1, i + around)).allSatisfy({ abs(hot.left[$0]) < knee / 2 }) {
+        far += 1
+        if hot.left[i] != clipped.left[i] { below += 1 }
+    }
+    check(far > 1_000 && below == 0, "far from any peak the samples are untouched (\(below) of \(far) changed)")
+
+    // Aliasing: 15 kHz driven 6 dB past the knee. Its third harmonic, 45
+    // kHz, would fold to 900 Hz at 44.1 kHz.
+    let tone = sine(hz: 15_000, dbfs: db(Double(knee)) + 6, seconds: 1)
+    let toneAudio = StereoAudio(left: tone, right: tone)
+    _ = try Clipper.process(toneAudio, ceiling: ceiling)
+    let bent = Array(UnsafeBufferPointer(start: toneAudio.left, count: toneAudio.frameCount))
+    let alias = toneDB(bent, hz: 900) - toneDB(bent, hz: 15_000)
+    let naive = tone.map { Clipper.curve(abs($0), knee: knee, cap: cap) * ($0 < 0 ? -1 : 1) }
+    let naiveAlias = toneDB(naive, hz: 900) - toneDB(naive, hz: 15_000)
+    check(alias < -60, "15 kHz into the curve: alias at 900 Hz \(String(format: "%.1f", alias)) dB (without oversampling \(String(format: "%.1f", naiveAlias)) dB)")
+
+    // In the match: the clipped reference DropMaster could not reach.
+    let source = pinkStereo(seconds: 30, seed: 1)
+    let other = pinkStereo(seconds: 30, seed: 2)
+    let crushed = StereoAudio(left: (0..<source.frameCount).map { max(-1, min(1, source.left[$0] * 4)) },
+                              right: (0..<source.frameCount).map { max(-1, min(1, source.right[$0] * 4)) })
+    var on = LimiterSettings(); on.clipper = true; on.clipLimitDB = nil    // Max
+    let (reached, reachedReport) = try Matcher.match(target: other, reference: crushed, settings: on)
+    let reachedError = db(loudRMS(reached)) - db(loudRMS(crushed))
+    check(abs(reachedError) < 1.0,
+          "clipped reference, Clipper on: \(String(format: "%+.2f", reachedError)) dB (off: about -3), clip \(String(format: "%.1f", reachedReport.clipReductionDB)) dB, limiter \(String(format: "%.1f", reachedReport.limiterReductionDB)) dB, \(String(format: "%.2f", reachedReport.resultLUFS ?? -99)) of \(String(format: "%.2f", reachedReport.targetLUFS ?? -99)) LUFS")
+    check(Double(reached.peak) <= pow(10, reachedReport.ceilingDB / 20) + 1e-6, "clipped reference, Clipper on: peak ≤ ceiling")
+    let recordDeepest = 20 * log10(Double(reached.clipReduction.min() ?? 1))
+    check(reached.clipReduction.count == (reached.frameCount + Limiter.reductionChunk - 1) / Limiter.reductionChunk
+          && abs(recordDeepest - reachedReport.clipReductionDB) < 0.01
+          && reached.clipReduction.count == reached.gainReduction.count,
+          "CL record: \(reached.clipReduction.count) chunks beside GR's, deepest = the clipper's \(String(format: "%.2f", recordDeepest)) dB")
+
+    // On for ordinary references too: the switch always acts, so it can
+    // be heard against Off.
+    let loudSource = scaled(source, 2.5)
+    try Limiter(ceiling: pow(10, -0.1 / 20)).processAll(left: loudSource.left, right: loudSource.right, count: loudSource.frameCount)
+    for (name, reference) in [("loud master", loudSource), ("pink noise", source)] {
+        let (off, offReport) = try Matcher.match(target: other, reference: reference)
+        let (with, withReport) = try Matcher.match(target: other, reference: reference, settings: on)
+        let miss = (withReport.resultLUFS ?? -99) - (withReport.targetLUFS ?? 0)
+        check(Double(with.peak) <= pow(10, withReport.ceilingDB / 20) + 1e-6 && abs(miss) < 0.5
+              && withReport.limiterReductionDB > -2.5,
+              "\(name), Clipper on: \(String(format: "%+.2f", miss)) LU from the target, clip \(String(format: "%.1f", withReport.clipReductionDB)) dB, limiter \(String(format: "%.1f", withReport.limiterReductionDB)) dB (off: \(String(format: "%.1f", offReport.limiterReductionDB)) dB)")
+        check(offReport.clipReductionDB == 0 && off.clipReduction.isEmpty && !off.isIdentical(to: with),
+              "\(name): On and Off differ, Off does not clip and keeps no CL record")
+    }
+
+    // A limit: the clipper cuts no deeper, the limiter does the rest, and
+    // every limit lands between Off and Max.
+    let (crushedOff, _) = try Matcher.match(target: other, reference: crushed)
+    var three = on; three.clipLimitDB = 3
+    let (limited, limitedReport) = try Matcher.match(target: other, reference: crushed, settings: three)
+    let offLevel = db(loudRMS(crushedOff)), limitedLevel = db(loudRMS(limited)), maxLevel = db(loudRMS(reached))
+    check(limitedReport.clipReductionDB >= -3.05 && limitedReport.clipReductionDB <= -2.95
+          && limitedLevel > offLevel && limitedLevel < maxLevel,
+          "clip limit 3 dB: clipped \(String(format: "%.2f", limitedReport.clipReductionDB)) dB, limiter \(String(format: "%.1f", limitedReport.limiterReductionDB)) dB, level \(String(format: "%+.2f", limitedLevel - db(loudRMS(crushed)))) dB (off \(String(format: "%+.2f", offLevel - db(loudRMS(crushed)))), Max \(String(format: "%+.2f", maxLevel - db(loudRMS(crushed)))))")
+    check(Double(limited.peak) <= pow(10, limitedReport.ceilingDB / 20) + 1e-6, "clip limit 3 dB: peak ≤ ceiling")
+    var nine = on; nine.clipLimitDB = 9
+    let (_, nineReport) = try Matcher.match(target: other, reference: crushed, settings: nine)
+    check(nineReport.targetReached && nineReport.clipReductionDB >= -9.05,
+          "clip limit 9 dB: target reached, clipped \(String(format: "%.2f", nineReport.clipReductionDB)) dB")
+    var steps: [String] = []
+    var levels = [offLevel]
+    for limit in LimiterSettings.clipSteps {
+        var stepped = on; stepped.clipLimitDB = limit
+        let (result, report) = try Matcher.match(target: other, reference: crushed, settings: stepped)
+        levels.append(db(loudRMS(result)))
+        steps.append("\(Int(limit)): \(String(format: "%+.2f", levels.last! - db(loudRMS(crushed)))) (clip \(String(format: "%.1f", report.clipReductionDB)))")
+    }
+    levels.append(maxLevel)
+    check(zip(levels, levels.dropFirst()).allSatisfy { $0 <= $1 + 0.05 },
+          "louder step by step, Off to Max - \(steps.joined(separator: ", "))")
+    var one = on; one.clipLimitDB = 1
+    let (pinkMax, pinkMaxReport) = try Matcher.match(target: other, reference: source, settings: on)
+    let (pinkOne, pinkOneReport) = try Matcher.match(target: other, reference: source, settings: one)
+    check(pinkOne.isIdentical(to: pinkMax) && pinkOneReport == pinkMaxReport,
+          "clip limit 1 dB where \(String(format: "%.2f", pinkMaxReport.clipReductionDB)) dB is enough: identical to Max")
+
+    // Settings stored before the switch existed open with it off.
+    let old = #"{"enabled":true,"autoCeiling":false,"ceilingDB":-1.5,"autoRelease":true,"releaseMilliseconds":200}"#
+    let decoded = try JSONDecoder().decode(LimiterSettings.self, from: Data(old.utf8))
+    check(!decoded.clipper && decoded.ceilingDB == -1.5 && !decoded.autoCeiling && decoded.targetLUFS == nil,
+          "settings without the clipper key: Clipper off, the rest as stored")
+    let back = try JSONDecoder().decode(LimiterSettings.self, from: JSONEncoder().encode(three))
+    check(back == three, "settings with the Clipper at 3 dB: round trip")
+    let fromOneThree = try JSONDecoder().decode(LimiterSettings.self, from: Data((old.dropLast() + #","clipper":true}"#).utf8))
+    check(fromOneThree.clipper && fromOneThree.clipLimitDB == nil, "1.3 settings with the Clipper on open as Max")
+    check(LimiterSettings().clipLimitDB == 3 && decoded.clipLimitDB == 3,
+          "the clipper starts at 3 dB, also for settings from before it existed")
+    var maxOff = LimiterSettings(); maxOff.clipLimitDB = nil
+    let maxBack = try JSONDecoder().decode(LimiterSettings.self, from: JSONEncoder().encode(maxOff))
+    check(maxBack == maxOff, "Max with the box unticked: round trip (written as null)")
+
+    // Timing: a song against a clipped record.
+    let long = pinkStereo(seconds: 300, seed: 3)
+    let longRef = pinkStereo(seconds: 240, seed: 4)
+    let longCrushed = StereoAudio(left: (0..<longRef.frameCount).map { max(-1, min(1, longRef.left[$0] * 4)) },
+                                  right: (0..<longRef.frameCount).map { max(-1, min(1, longRef.right[$0] * 4)) })
+    let start = Date()
+    _ = try Matcher.match(target: long, reference: longCrushed, settings: on)
+    print("        5-minute match against a clipped reference, Clipper on, took \(String(format: "%.2f", Date().timeIntervalSince(start))) s")
+    var limitedOn = on; limitedOn.clipLimitDB = 3
+    let limitedStart = Date()
+    _ = try Matcher.match(target: long, reference: longCrushed, settings: limitedOn)
+    print("        the same at a 3 dB limit took \(String(format: "%.2f", Date().timeIntervalSince(limitedStart))) s")
+} catch {
+    check(false, "clipper threw \(error)")
+}
+
 // MARK: - Export
 
 print("Export")
@@ -373,6 +533,10 @@ do {
     let n = 44_100
     let original = StereoAudio(left: [Float](repeating: 0.5, count: n), right: [Float](repeating: 0.5, count: n))
     let matched = StereoAudio(left: [Float](repeating: -0.25, count: n), right: [Float](repeating: -0.25, count: n))
+    // Records as the limiter and the clipper keep them: -6 and -3 dB.
+    let chunks = (n + Limiter.reductionChunk - 1) / Limiter.reductionChunk
+    matched.gainReduction = [Float](repeating: 0.5, count: chunks)
+    matched.clipReduction = [Float](repeating: Float(pow(10, -3.0 / 20)), count: chunks)
     let core = ABCore()
     core.original.store(UnsafeRawPointer(Unmanaged.passUnretained(original).toOpaque()), ordering: .releasing)
     core.matched.store(UnsafeRawPointer(Unmanaged.passUnretained(matched).toOpaque()), ordering: .releasing)
@@ -404,6 +568,10 @@ do {
     check(steps(switching) < 0.01 && switching.first! > 0.49, "switch: crossfades (largest step \(steps(switching)))")
     check(switched.allSatisfy { abs($0 + 0.25) < 1e-6 }, "switch: then the matched version")
     check(core.position.load(ordering: .acquiring) == 4 * frames, "switch: same playhead, no jump")
+    let meterGR = Float(bitPattern: core.meterReduction.load(ordering: .relaxed))
+    let meterCL = Float(bitPattern: core.meterClip.load(ordering: .relaxed))
+    check(abs(meterGR + 6.02) < 0.01 && abs(meterCL + 3) < 0.01,
+          "meters while Matched plays: GR \(String(format: "%.2f", meterGR)) dB, CL \(String(format: "%.2f", meterCL)) dB from the records")
 
     core.wantsToPlay.store(false, ordering: .releasing)
     let fadeOut = pull()

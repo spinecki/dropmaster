@@ -34,7 +34,8 @@
 //  after the play/pause fade. Peak per channel with a 20 dB/s fall,
 //  momentary and short-term loudness (see LiveLoudness), and while Matched
 //  plays the limiter's gain reduction at the playhead, looked up in the
-//  record the limiter kept. The render block publishes them as atomics;
+//  record the limiter kept - and the clipper's, from its own record, when
+//  it is on. The render block publishes them as atomics;
 //  the UI reads them thirty times a second.
 //
 
@@ -64,12 +65,13 @@ nonisolated final class ABCore: @unchecked Sendable {
     let running = Atomic<Bool>(false)
 
     // Meters, as bit patterns: peaks (Float, linear), loudness (Double,
-    // LUFS, NaN for none), reduction (Float, dB ≤ 0).
+    // LUFS, NaN for none), reductions (Float, dB ≤ 0).
     let meterLeft = Atomic<UInt32>(0)
     let meterRight = Atomic<UInt32>(0)
     let meterMomentary = Atomic<UInt64>(Double.nan.bitPattern)
     let meterShortTerm = Atomic<UInt64>(Double.nan.bitPattern)
     let meterReduction = Atomic<UInt32>(Float(0).bitPattern)
+    let meterClip = Atomic<UInt32>(Float(0).bitPattern)
     /// Set by the UI thread; the render block clears the loudness state.
     let resetMeters = Atomic<Bool>(false)
 
@@ -105,7 +107,8 @@ nonisolated final class ABCore: @unchecked Sendable {
             guard let rawOriginal = original.load(ordering: .acquiring), wants || level > 0 else {
                 level = 0
                 running.store(false, ordering: .releasing)
-                publishMeters(left: outLeft, right: outRight, count: 0, frames: count, reductionDB: 0, audible: false)
+                publishMeters(left: outLeft, right: outRight, count: 0, frames: count, reductionDB: 0, clipDB: 0,
+                              audible: false)
                 isSilence.pointee = true
                 return noErr
             }
@@ -129,11 +132,15 @@ nonisolated final class ABCore: @unchecked Sendable {
             var reachedEnd = false
             var advanced = 0
             var reductionDB: Float = 0
+            var clipDB: Float = 0
             if let rawMatched, gainMatched > 0 || targetMatched > 0 {
                 Unmanaged<StereoAudio>.fromOpaque(rawMatched)._withUnsafeGuaranteedRef { matched in
                     let chunk = start / Limiter.reductionChunk
                     if chunk < matched.gainReduction.count {
                         reductionDB = 20 * log10(max(matched.gainReduction[chunk], 1e-6))
+                    }
+                    if chunk < matched.clipReduction.count {
+                        clipDB = 20 * log10(max(matched.clipReduction[chunk], 1e-6))
                     }
                 }
             }
@@ -184,7 +191,7 @@ nonisolated final class ABCore: @unchecked Sendable {
             let audible = level > 0 || (wants && !reachedEnd)
             running.store(audible, ordering: .releasing)
             publishMeters(left: outLeft, right: outRight, count: advanced, frames: count,
-                          reductionDB: reductionDB * gainMatched, audible: audible)
+                          reductionDB: reductionDB * gainMatched, clipDB: clipDB * gainMatched, audible: audible)
             return noErr
         }
     }
@@ -192,7 +199,7 @@ nonisolated final class ABCore: @unchecked Sendable {
     /// Audio thread. `count` rendered frames to measure, `frames` the
     /// length of the block (for the peaks' fall).
     private func publishMeters(left: UnsafePointer<Float>, right: UnsafePointer<Float>, count: Int, frames: Int,
-                               reductionDB: Float, audible: Bool) {
+                               reductionDB: Float, clipDB: Float, audible: Bool) {
         let fall = Float(exp(-fallPerFrame * Double(frames)))
         var blockLeft: Float = 0, blockRight: Float = 0
         if count > 0 {
@@ -210,6 +217,7 @@ nonisolated final class ABCore: @unchecked Sendable {
         meterMomentary.store(lufs(live.momentaryPower).bitPattern, ordering: .relaxed)
         meterShortTerm.store(lufs(live.shortTermPower).bitPattern, ordering: .relaxed)
         meterReduction.store((audible ? reductionDB : 0).bitPattern, ordering: .relaxed)
+        meterClip.store((audible ? clipDB : 0).bitPattern, ordering: .relaxed)
     }
 }
 
@@ -220,6 +228,8 @@ nonisolated struct LiveLevels: Equatable, Sendable {
     var momentary: Double?
     var shortTerm: Double?
     var reductionDB: Float
+    /// The clipper's reduction at the playhead, dB ≤ 0.
+    var clipDB: Float = 0
 }
 
 @Observable
@@ -325,7 +335,8 @@ final class ABPlayer {
                           right: Float(bitPattern: core.meterRight.load(ordering: .relaxed)),
                           momentary: optional(core.meterMomentary.load(ordering: .relaxed)),
                           shortTerm: optional(core.meterShortTerm.load(ordering: .relaxed)),
-                          reductionDB: Float(bitPattern: core.meterReduction.load(ordering: .relaxed)))
+                          reductionDB: Float(bitPattern: core.meterReduction.load(ordering: .relaxed)),
+                          clipDB: Float(bitPattern: core.meterClip.load(ordering: .relaxed)))
     }
 
     private static func pointer(_ audio: StereoAudio?) -> UnsafeRawPointer? {

@@ -31,15 +31,20 @@
 //     the amount its peaks were shaved.
 //
 //     Limit: a reference *clipped* to its loudness cannot be reached
-//     without clipping, and DropMaster does not clip - the harness
-//     measured about 3 dB short against pink noise clipped by 12 dB.
-//     Measuring through the real limiter and pushing harder was tried: it
-//     limited 6 dB more and came out quieter still, since the release
-//     pumps the level down between the peaks.
+//     without clipping, and by default DropMaster does not clip - the
+//     harness measured about 3 dB short against pink noise clipped by
+//     12 dB. Measuring through the real limiter and pushing harder was
+//     tried: it limited 6 dB more and came out quieter still, since the
+//     release pumps the level down between the peaks. The Clipper is the
+//     answer for such references (stage 5).
 //
 //  5. Back to L/R, and the limiter, ceiling at the reference's own peak
 //     (never above -0.1 dBFS). A reference mastered to -1 dBFS for a
-//     streaming service yields a result that leaves the same room.
+//     streaming service yields a result that leaves the same room. With
+//     the Clipper on, a soft clipper (Clipper) takes the peaks first and
+//     leaves the limiter about 1.5 dB - or more, where the panel's limit
+//     stops it from cutting deeper. Off, the result is exactly what it was
+//     before the Clipper existed.
 //
 //  Stages 1-4 are `prepare`, stage 5 is `finish`, kept separate on purpose:
 //  the limiter panel changes only stage 5, a fraction of a second, and
@@ -71,6 +76,8 @@ nonisolated struct MatchReport: Sendable, Equatable {
     var targetLUFS: Double? = nil
     var resultLUFS: Double? = nil
     var targetReached = true
+    /// The clipper's deepest reduction, in dB (0 with the Clipper off).
+    var clipReductionDB = 0.0
 }
 
 nonisolated enum MatchError: Error, LocalizedError {
@@ -244,7 +251,7 @@ nonisolated enum Matcher {
 
     /// Stage 5: the level, then the limiter - or, with the limiter off, a
     /// plain turn-down until the peaks fit under the ceiling. Never clips
-    /// either way.
+    /// either way, unless the Clipper is switched on.
     ///
     /// The level is the reference's plus the panel's offset, or - with a
     /// LUFS target - whatever gain makes the *limited* result measure the
@@ -289,6 +296,10 @@ nonisolated enum Matcher {
         return (found.run.audio, report(preparation, found.run, target: target, measured: found.lufs))
     }
 
+    private static func ceilingDB(_ preparation: MatchPreparation, settings: LimiterSettings) -> Double {
+        settings.autoCeiling ? preparation.autoCeilingDB : min(settings.ceilingDB, maximumCeilingDB)
+    }
+
     static let targetRounds = 6
     /// Close enough: a tenth of the smallest step anyone reads on a meter.
     static let targetTolerance = 0.05
@@ -300,6 +311,7 @@ nonisolated enum Matcher {
         let gainDB: Double
         let ceilingDB: Double
         let reductionDB: Double
+        let clipReductionDB: Double
     }
 
     /// One run of the level and limiter stage, `offsetDB` above the
@@ -308,9 +320,7 @@ nonisolated enum Matcher {
                                    offsetDB: Double) throws -> StageRun {
         let source = preparation.unlimited
         let count = source.frameCount
-        let ceilingDB = settings.autoCeiling
-            ? preparation.autoCeilingDB
-            : min(settings.ceilingDB, maximumCeilingDB)
+        let ceilingDB = ceilingDB(preparation, settings: settings)
         let ceiling = Float(pow(10, ceilingDB / 20))
         var gainDB = preparation.gainDB + offsetDB
 
@@ -321,7 +331,13 @@ nonisolated enum Matcher {
         try Task.checkCancellation()
 
         var reductionDB = 0.0
+        var clipReductionDB = 0.0
         if settings.enabled {
+            if settings.clipper {
+                let clipping = try Clipper.process(result, ceiling: ceiling, limitDB: settings.clipLimitDB)
+                clipReductionDB = clipping.reductionDB
+                result.clipReduction = clipping.record
+            }
             let limiter = Limiter(ceiling: ceiling,
                                   releaseSeconds: settings.autoRelease ? nil : settings.releaseMilliseconds / 1000)
             try limiter.processAll(left: result.left, right: result.right, count: count)
@@ -336,7 +352,8 @@ nonisolated enum Matcher {
                 gainDB += 20 * log10(Double(down))
             }
         }
-        return StageRun(audio: result, gainDB: gainDB, ceilingDB: ceilingDB, reductionDB: reductionDB)
+        return StageRun(audio: result, gainDB: gainDB, ceilingDB: ceilingDB, reductionDB: reductionDB,
+                        clipReductionDB: clipReductionDB)
     }
 
     private static func report(_ preparation: MatchPreparation, _ run: StageRun,
@@ -344,7 +361,8 @@ nonisolated enum Matcher {
         MatchReport(midCurveDB: preparation.midCurveDB, sideCurveDB: preparation.sideCurveDB,
                     gainDB: run.gainDB, ceilingDB: run.ceilingDB, limiterReductionDB: run.reductionDB,
                     targetLUFS: target, resultLUFS: measured,
-                    targetReached: target.map { t in measured.map { abs($0 - t) <= 0.1 } ?? false } ?? true)
+                    targetReached: target.map { t in measured.map { abs($0 - t) <= 0.1 } ?? false } ?? true,
+                    clipReductionDB: run.clipReductionDB)
     }
 }
 
@@ -386,6 +404,8 @@ nonisolated struct LimiterSettings: Codable, Sendable, Equatable {
     /// Ceiling, at values an engineer would dial in, roughly evenly spaced
     /// on a log scale.
     static let releaseSteps: [Double] = [10, 15, 20, 30, 40, 50, 70, 100, 150, 200, 300, 400, 500, 700, 1000]
+    /// The clipper slider's limits, between Off and Max.
+    static let clipSteps: [Double] = [1, 2, 3, 4, 6, 9]
 
     var enabled = true
     var autoCeiling = true
@@ -397,4 +417,55 @@ nonisolated struct LimiterSettings: Codable, Sendable, Equatable {
     /// settings stored before it existed still decode - as do settings
     /// with the `targetName` key it once had (unknown keys are ignored).
     var targetLUFS: Double?
+    /// A soft clipper before the limiter (see Clipper). Off by default:
+    /// with it off, the result is the one DropMaster always gave.
+    var clipper = false
+    /// How deep the clipper may cut, in dB; nil is Max - no limit. 3 dB to
+    /// start with: ticking the box should not bring back the 7 dB deep
+    /// clipping Max gave a dynamic target against a loud reference.
+    var clipLimitDB: Double? = 3
+
+    /// Written out, now that both directions of the coding are our own.
+    enum CodingKeys: String, CodingKey {
+        case enabled, autoCeiling, ceilingDB, autoRelease, releaseMilliseconds, targetLUFS, clipper, clipLimitDB
+    }
+}
+
+nonisolated extension LimiterSettings {
+    /// Every key optional, each falling back to its default: settings and
+    /// presets stored before a field existed still open. Unknown keys are
+    /// ignored, so older versions read newer files too. (`Swift.Decoder`:
+    /// the app has a Decoder of its own, for audio files.)
+    init(from decoder: Swift.Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = LimiterSettings()
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
+        autoCeiling = try c.decodeIfPresent(Bool.self, forKey: .autoCeiling) ?? d.autoCeiling
+        ceilingDB = try c.decodeIfPresent(Double.self, forKey: .ceilingDB) ?? d.ceilingDB
+        autoRelease = try c.decodeIfPresent(Bool.self, forKey: .autoRelease) ?? d.autoRelease
+        releaseMilliseconds = try c.decodeIfPresent(Double.self, forKey: .releaseMilliseconds) ?? d.releaseMilliseconds
+        targetLUFS = try c.decodeIfPresent(Double.self, forKey: .targetLUFS)
+        clipper = try c.decodeIfPresent(Bool.self, forKey: .clipper) ?? d.clipper
+        // Max is written as null, so a missing key means an older file:
+        // 1.3's switch on was Max, and anything else starts at the default.
+        if c.contains(.clipLimitDB) {
+            clipLimitDB = try c.decodeIfPresent(Double.self, forKey: .clipLimitDB)
+        } else {
+            clipLimitDB = clipper ? nil : d.clipLimitDB
+        }
+    }
+
+    /// As synthesized, except that Max (nil) is written as null rather
+    /// than left out - see `init(from:)`.
+    func encode(to encoder: Swift.Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(autoCeiling, forKey: .autoCeiling)
+        try c.encode(ceilingDB, forKey: .ceilingDB)
+        try c.encode(autoRelease, forKey: .autoRelease)
+        try c.encode(releaseMilliseconds, forKey: .releaseMilliseconds)
+        try c.encodeIfPresent(targetLUFS, forKey: .targetLUFS)
+        try c.encode(clipper, forKey: .clipper)
+        try c.encode(clipLimitDB, forKey: .clipLimitDB)
+    }
 }

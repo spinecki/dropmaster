@@ -47,7 +47,7 @@ struct DropZone: View {
                               style: StrokeStyle(lineWidth: targeted ? 2 : 1.2,
                                                  dash: slot.url == nil && preset == nil && profile == nil ? [6, 4] : []))
             content
-                .padding(14)
+                .padding(12)
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onChoose)
@@ -63,7 +63,7 @@ struct DropZone: View {
 
     @ViewBuilder
     private var content: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             Text(slotNumber.map { "\(role.title.uppercased()) · \($0)" } ?? role.title.uppercased())
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
@@ -82,7 +82,7 @@ struct DropZone: View {
     private func presetContent(_ name: String, details: String) -> some View {
         Group {
             Image(systemName: "slider.horizontal.3")
-                .font(.system(size: 30, weight: .light))
+                .font(.system(size: 26, weight: .light))
                 .foregroundStyle(Color.accentColor)
             Text(name)
                 .font(.headline)
@@ -99,7 +99,7 @@ struct DropZone: View {
         switch slot.state {
         case .empty:
             Image(systemName: "waveform.badge.plus")
-                .font(.system(size: 30, weight: .light))
+                .font(.system(size: 26, weight: .light))
                 .foregroundStyle(.secondary)
             Text(role.subtitle)
                 .font(.headline)
@@ -115,7 +115,7 @@ struct DropZone: View {
                 .foregroundStyle(.secondary)
         case .ready(let audio, let info):
             Image(systemName: "waveform")
-                .font(.system(size: 30, weight: .light))
+                .font(.system(size: 26, weight: .light))
                 .foregroundStyle(Color.accentColor)
             fileName
             Text(Self.details(audio, info))
@@ -123,7 +123,7 @@ struct DropZone: View {
                 .foregroundStyle(.secondary)
         case .failed(let message):
             Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 26, weight: .light))
+                .font(.system(size: 22, weight: .light))
                 .foregroundStyle(.orange)
             fileName
             Text(message)
